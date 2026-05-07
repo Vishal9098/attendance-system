@@ -10,12 +10,9 @@ import json
 router = APIRouter()
 
 async def fetch_attendance_context(db) -> dict:
-    """Fetch current data to give AI context."""
     today = date.today().isoformat()
+    late_threshold_hour = 9
 
-    late_threshold_hour = 9  # 9 AM considered on-time
-
-    # Today's attendance
     today_records = await db.attendance.find({"date": today}).to_list(500)
 
     late_employees = []
@@ -31,7 +28,6 @@ async def fetch_attendance_context(db) -> dict:
         if r.get("status") == "present":
             present.append(r["user_name"])
 
-    # Pending OT
     pending_ot = await db.overtime.find({"status": "pending"}).to_list(100)
     ot_list = [{"name": r["employee_name"], "date": r["date"], "reason": r["reason"]} for r in pending_ot]
 
@@ -48,19 +44,43 @@ async def fetch_attendance_context(db) -> dict:
         "pending_overtime_requests": ot_list
     }
 
-async def query_gemini(prompt: str, context: dict) -> str:
-    """Query Google Gemini API."""
-    if not settings.GEMINI_API_KEY:
-        raise HTTPException(500, "Gemini API key not configured")
+async def query_openrouter(prompt: str, context: dict) -> str:
+    system_msg = f"You are an attendance management AI assistant. Answer based on this data: {json.dumps(context)}"
 
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:3000",
+                "X-Title": "AttendAI"
+            },
+            json={
+                "model": "mistralai/mistral-small-3.2-24b-instruct:free",
+                "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt}
+                ]
+            }
+        )
+
+    data = resp.json()
+
+    if "choices" in data and len(data["choices"]) > 0:
+        return data["choices"][0]["message"]["content"]
+    elif "error" in data:
+        raise HTTPException(500, f"OpenRouter error: {data['error']}")
+    else:
+        raise HTTPException(500, f"Unexpected response: {str(data)[:200]}")
+
+async def query_gemini(prompt: str, context: dict) -> str:
     system_prompt = f"""You are an AI assistant for an Attendance Management System.
 Today's attendance data: {json.dumps(context, indent=2)}
+Answer the manager/admin's query based on this data. Be concise and helpful."""
 
-Answer the manager/admin's query based on this data. Be concise and helpful.
-Format numbers clearly. If asked about specific employees, list them with relevant details."""
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}"
-
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={settings.GEMINI_API_KEY}"
     payload = {
         "contents": [{
             "parts": [{"text": f"{system_prompt}\n\nQuery: {prompt}"}]
@@ -78,42 +98,18 @@ Format numbers clearly. If asked about specific employees, list them with releva
     except (KeyError, IndexError):
         raise HTTPException(500, "Invalid response from Gemini API")
 
-async def query_openrouter(prompt: str, context: dict) -> str:
-    """Fallback: Query OpenRouter API."""
-    if not settings.OPENROUTER_API_KEY:
-        raise HTTPException(500, "No AI API key configured")
-
-    system_msg = f"You are an attendance management AI. Data: {json.dumps(context)}"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "mistralai/mistral-7b-instruct:free",
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt}
-                ]
-            }
-        )
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
-
 @router.post("/query", response_model=AIResponse)
 async def ai_query(query: AIQuery, current_user=Depends(require_role("admin", "manager"))):
     db = get_db()
     context = await fetch_attendance_context(db)
 
-    # Try Gemini first, fall back to OpenRouter
     try:
-        if settings.GEMINI_API_KEY:
+        if settings.OPENROUTER_API_KEY:
+            answer = await query_openrouter(query.query, context)
+        elif settings.GEMINI_API_KEY:
             answer = await query_gemini(query.query, context)
         else:
-            answer = await query_openrouter(query.query, context)
+            raise HTTPException(500, "No AI API key configured")
     except Exception as e:
         raise HTTPException(500, f"AI query failed: {str(e)}")
 
@@ -121,6 +117,5 @@ async def ai_query(query: AIQuery, current_user=Depends(require_role("admin", "m
 
 @router.get("/context")
 async def get_context(current_user=Depends(require_role("admin", "manager"))):
-    """Get current attendance context for debugging."""
     db = get_db()
     return await fetch_attendance_context(db)
